@@ -77,11 +77,12 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         sys.stdout.flush()
 
         extr = cam_extrinsics[key]
-        intr = cam_intrinsics[extr.id]
+        intr = cam_intrinsics[extr.camera_id]
         height = intr.height
         width = intr.width
 
-        uid = intr.id
+        uid = extr.id
+
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
@@ -150,31 +151,64 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
-        root_dir=os.path.dirname(path)
-        tsv = glob.glob(os.path.join(root_dir, '*.tsv'))[0]
-        scene_name = os.path.basename(tsv)[:-4]  
-        files = pd.read_csv(tsv, sep='\t')                          
-        files = files[~files['id'].isnull()]   
-        files.reset_index(inplace=True, drop=True)
+        scene_name = os.path.basename(os.path.normpath(path))
+        preferred_tsv = os.path.join(path, f"{scene_name}.tsv")
 
-        img_path_to_id = {}
-        for v in cam_extrinsics.values():
-            img_path_to_id[v.name] = v.id
-        img_ids = []
-        image_paths = {} # {id: filename}
-        for filename in list(files['filename']):
-            if filename in img_path_to_id:
-                id_ = img_path_to_id[filename]
-                image_paths[id_] = filename              
-                img_ids += [id_]               
+        if os.path.exists(preferred_tsv):
+            tsv_files = [preferred_tsv]
+        else:
+            tsv_files = glob.glob(os.path.join(path, "*.tsv"))
 
-        img_ids_train = [id_ for i, id_ in enumerate(img_ids) 
-                                    if files.loc[i, 'split']=='train']
-        img_ids_test = [id_ for i, id_ in enumerate(img_ids)
-                                    if files.loc[i, 'split']=='test']
-        
-        train_cam_infos =[ c for c in cam_infos if c.uid in img_ids_train]
-        test_cam_infos =[ c for c in cam_infos if c.uid in img_ids_test]
+        if len(tsv_files) > 0:
+            print(f"[Eval] Using TSV split: {tsv_files[0]}")
+
+            tsv = tsv_files[0]
+            files = pd.read_csv(tsv, sep="\t")
+            files.columns = files.columns.str.strip()
+            files = files[~files["filename"].isnull()]
+            files.reset_index(inplace=True, drop=True)
+
+            img_path_to_id = {}
+            for v in cam_extrinsics.values():
+                img_path_to_id[v.name] = v.id
+
+            img_ids = []
+            image_paths = {}
+
+            for filename in list(files["filename"]):
+                if filename in img_path_to_id:
+                    id_ = img_path_to_id[filename]
+                    image_paths[id_] = filename
+                    img_ids += [id_]
+
+            img_ids_train = [
+                id_ for i, id_ in enumerate(img_ids)
+                if files.loc[i, "split"] == "train"
+            ]
+
+            img_ids_test = [
+                id_ for i, id_ in enumerate(img_ids)
+                if files.loc[i, "split"] == "test"
+            ]
+
+            train_cam_infos = [c for c in cam_infos if c.uid in img_ids_train]
+            test_cam_infos = [c for c in cam_infos if c.uid in img_ids_test]
+
+        else:
+            print("[Eval] No TSV found -> using COLMAP fallback split (every 8th image)")
+            
+            cam_infos_sorted = sorted(cam_infos, key=lambda c: c.image_name)
+
+            train_cam_infos = [
+                c for idx, c in enumerate(cam_infos_sorted)
+                if idx % 8 != 0
+            ]
+
+            test_cam_infos = [
+                c for idx, c in enumerate(cam_infos_sorted)
+                if idx % 8 == 0
+            ]
+
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
