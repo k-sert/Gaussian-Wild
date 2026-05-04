@@ -13,6 +13,7 @@ class Color_net(nn.Module):
                 en_dims,
                 de_dims,
                 multires,
+                identity_dim=0,
                 pre_compc=False,
                 cde_dims=None,
                 use_pencoding=[False,False],#postion viewdir
@@ -22,6 +23,7 @@ class Color_net(nn.Module):
                 use_decode_with_pos=False,
                 ):
         super().__init__()
+        pfin_dim = pfin_dim + identity_dim
         self.pre_compc=pre_compc
         self.use_pencoding=use_pencoding
         self.embed_fns=[]
