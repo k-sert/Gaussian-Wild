@@ -55,7 +55,13 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
-        
+
+        # === IDENTITY FEATURES ===
+        self.use_identity = False # whether to use identity features
+        self.identity_dim = 16 
+        self.identity_trainable = False # frozen identity feature, can be set to true for fine-tuning
+        # =========================
+
         self.scene_name="brandenburg"
         self.use_colors_precomp=True#True
         self.use_decode_with_pos=False
