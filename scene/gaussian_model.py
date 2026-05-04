@@ -14,6 +14,7 @@ import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
+from sklearn.neighbors import NearestNeighbors
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
@@ -56,6 +57,15 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+
+        # === Identity features ===
+        self._identity = torch.empty(0)
+        self.use_identity = getattr(args, "use_identity", False)
+        self.identity_dim = getattr(args, "identity_dim", 16)
+        self.identity_trainable = getattr(args, "identity_trainable", False)
+        self.identity_path = getattr(args, "identity_path", "")
+        self.identity_xyz_path = getattr(args, "identity_xyz_path", "")
+
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -104,7 +114,10 @@ class GaussianModel:
             self.colornet_inter_weight=1.0
             self.projection_feature_weight=1.0
             if args.color_net_type=="naive":
-                self.color_net=Color_net(**args.color_net_params).to(self.device)
+                self.color_net = Color_net(
+                    **args.color_net_params,
+                    identity_dim=self.identity_dim if self.use_identity else 0
+                ).to(self.device)
             else: raise NotImplementedError
                 
         self.use_features_mask=args.use_features_mask
@@ -143,7 +156,34 @@ class GaussianModel:
     @property
     def get_colors(self):
         return self._pre_comp_color
-    
+
+    # === identity feature loading === 
+    def load_identity_from_npy(self):
+        if not self.use_identity:
+            return
+
+        assert self.identity_path != "", "Set --identity_path"
+        assert self.identity_xyz_path != "", "Set --identity_xyz_path"
+
+        identity = np.load(self.identity_path)        # (N_GG, 16)
+        xyz_src = np.load(self.identity_xyz_path)     # (N_GG, 3)
+        xyz_tgt = self._xyz.detach().cpu().numpy()    # (N_GSW, 3)
+
+        assert identity.shape[1] == self.identity_dim
+        assert identity.shape[0] == xyz_src.shape[0]
+
+        neighbor_model = NearestNeighbors(n_neighbors=1).fit(xyz_src)
+        distances, indices = neighbor_model.kneighbors(xyz_tgt)
+
+        identity_mapped = identity[indices[:, 0]]
+
+        print(f"[Identity Mapping] Mean NN distance: {distances.mean():.6f}")
+
+        self._identity = nn.Parameter(
+            torch.tensor(identity_mapped, dtype=torch.float, device="cuda"),
+            requires_grad=self.identity_trainable
+        )
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -172,7 +212,11 @@ class GaussianModel:
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-       
+        
+        # Initialize identity features after xyz is available for NN mapping
+        if self.use_identity: 
+            self.load_identity_from_npy()
+
         self._features_intrinsic = nn.Parameter(features[:,:,:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
@@ -239,15 +283,23 @@ class GaussianModel:
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            
             {'params': [self._features_intrinsic], 'lr': training_args.feature_lr / 20.0, "name": "f_intr"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
         self.prune_params_names=["xyz","f_intr","opacity","scaling","rotation"]
-       
-        
+
+        # === Identity features ===
+        if self.use_identity:
+            self.prune_params_names.append("identity")
+
+            l.append({
+                'params': [self._identity],
+                'lr': training_args.feature_lr if self.identity_trainable else 0.0,
+                "name": "identity"
+            })
+
         if self.use_kmap_pjmap or self.use_okmap:
             l.extend( [
                 {'params': self.map_generator.parameters(), 'lr': training_args.map_generator_lr, "name": "map_generator"},
@@ -332,6 +384,10 @@ class GaussianModel:
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
 
+        # Identity features are serialized as obj_dc_* attributes
+        if self.use_identity:
+            for i in range(self.identity_dim):
+                l.append(f"obj_dc_{i}")
 
         return l
 
@@ -350,8 +406,15 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         
-        attributes = np.concatenate((xyz, normals, f_intr, opacities, scale, rotation), axis=1)
-            
+        # attributes = np.concatenate((xyz, normals, f_intr, opacities, scale, rotation), axis=1)
+
+        # Keep the PLY attribute order aligned with construct_list_of_attributes
+        if self.use_identity:
+            identity = self._identity.detach().cpu().numpy()
+            attributes = np.concatenate((xyz, normals, f_intr, opacities, scale, rotation, identity), axis=1)
+        else:
+            attributes = np.concatenate((xyz, normals, f_intr, opacities, scale, rotation), axis=1)
+
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -407,6 +470,22 @@ class GaussianModel:
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
+        # Restore identity features from the obj_dc_* PLY attributes
+        if self.use_identity:
+            id_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("obj_dc_")]
+            id_names = sorted(id_names, key=lambda x: int(x.split('_')[-1]))
+
+            assert len(id_names) == self.identity_dim, f"Expected {self.identity_dim} identity dims, got {len(id_names)}"
+
+            identity = np.zeros((xyz.shape[0], len(id_names)))
+            for idx, name in enumerate(id_names):
+                identity[:, idx] = np.asarray(plydata.elements[0][name])
+
+            self._identity = nn.Parameter(
+                torch.tensor(identity, dtype=torch.float, device="cuda"),
+                requires_grad=self.identity_trainable
+            )
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         
@@ -477,7 +556,12 @@ class GaussianModel:
                     # _point_features1,project_mask=project2d(_xyz,viewpoint_camera.world_view_transform,viewpoint_camera.intrinsic_martix,box_coord1,feature_maps[-1,...].unsqueeze(0))
                 
             _point_features=torch.cat([_point_features0,_point_features1],dim=1)
-       
+        
+        # Append persistent identity features to the sampled point features
+        if self.use_identity:
+            identity = self._identity
+            _point_features = torch.cat([_point_features, identity], dim=1)
+        
         if self.use_color_net:
             if self.use_colors_precomp:
                 if self.color_net_type in ["naive"]:
@@ -562,6 +646,9 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        if self.use_identity:
+            self._identity = optimizable_tensors["identity"]
         
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         if (self.use_kmap_pjmap or self.use_okmap) :
@@ -611,6 +698,9 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        if self.use_identity:
+            self._identity = optimizable_tensors["identity"]
+
         if ( self.use_kmap_pjmap or self.use_okmap) :
             if (self.use_kmap_pjmap ) and self.use_wo_adative:
                 self.box_coord1=optimizable_tensors["box_coord"]
@@ -640,7 +730,10 @@ class GaussianModel:
         new_tensor["xyz"] = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)     
         new_tensor["scaling"] = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_tensor["opacity"]  = self._opacity[selected_pts_mask].repeat(N,1)
-        new_tensor["rotation"]  = self._rotation[selected_pts_mask].repeat(N,1)         
+        new_tensor["rotation"]  = self._rotation[selected_pts_mask].repeat(N,1)
+        
+        if self.use_identity:
+            new_tensor["identity"] = self._identity[selected_pts_mask].repeat(N, 1)
         
         new_tensor["f_intr"]  = self._features_intrinsic[selected_pts_mask].repeat(N,1,1)
         
@@ -670,6 +763,9 @@ class GaussianModel:
         new_tensor["opacity"]  = self._opacity[selected_pts_mask]
         new_tensor["scaling"]  = self._scaling[selected_pts_mask]
         new_tensor["rotation"]  = self._rotation[selected_pts_mask]
+        
+        if self.use_identity:
+            new_tensor["identity"] = self._identity[selected_pts_mask]
 
         if (self.use_kmap_pjmap or self.use_okmap) :
             if (self.use_kmap_pjmap ) and self.use_wo_adative:
@@ -680,7 +776,6 @@ class GaussianModel:
         
         self.densification_postfix(new_tensor)
 
-    #####
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
