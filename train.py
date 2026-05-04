@@ -373,6 +373,12 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+
+    # === IDENTITY FEATURES ===
+    parser.add_argument("--identity_path", type=str, default="")
+    parser.add_argument("--identity_xyz_path", type=str, default="")
+    # =========================
+
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
